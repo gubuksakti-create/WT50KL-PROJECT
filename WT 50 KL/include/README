@@ -1,0 +1,426 @@
+Water Truck Controller System
+Dokumentasi  Algoritma & Cara Pengoperasian
+
+📋 Daftar Isi
+1.Gambaran Sistem
+2.Hardware Configuration
+3.Algoritma Utama
+4.Cara Pengoperasian
+5.Sistem Penyimpanan (FRAM)
+6.Fitur Keamanan
+7.Troubleshooting
+
+1.Gambaran Sistem
+Sistem Water Truck Controller adalah pengendali mikro berbasis Arduino Nano untuk mengelola sistem penyemprotan air pada kendaraan tangki. 
+Sistem ini mengontrol:  
+
+    3 Sprayer (Kiri, Tengah, Kanan)
+    Water Pump (Pompa Air)
+    Intermittent Mode (Automatis ON/OFF)
+    Monitoring KPI (Jam Operasi & Jarak Semprot)
+    Penyimpanan Konfigurasi di FRAM FM24C64
+    Display LCD 16x2 untuk informasi real-time
+    RTC DS3231 untuk waktu (opsional)
+
+Hardware Configuration
+Pin Definitions (constants.h)
+Output Pins (Relay)
+cpp
+#define RELAY_SPRAYER_RH        9   // Sprayer Kanan
+#define RELAY_SPRAYER_CENTER    12  // Sprayer Tengah
+#define RELAY_SPRAYER_LH        11  // Sprayer Kiri
+#define RELAY_ROTARY            6   // Lampu Rotary
+#define RELAY_AUTO_MAN_IND      7   // Indikator Mode Auto
+#define RELAY_WORKING_LAMP      8   // Lampu Kerja
+#define RELAY_WATER_PUMP        10  // Pompa Air
+#define PIN_MOSFET_GATE         13  // Kontrol PWM Valve
+#define RELAY_WATER_LEVEL_ALARM 4   // Alarm Level Air (opsional)
+Input Pins
+cpp
+#define PIN_THROTTLE_PEDAL      A6  // Pedal Throttle (Analog)
+#define PIN_TIMER_POT           A7  // Potensiometer Timer (Analog)
+#define BUTTON_SPRAYER_RH       A0  // Tombol Sprayer Kanan
+#define BUTTON_SPRAYER_CENTER   A1  // Tombol Sprayer Tengah
+#define BUTTON_SPRAYER_LH       A2  // Tombol Sprayer Kiri
+#define PIN_ENGINE_RUNNING      A3  // Sensor Engine Running
+#define PIN_SPEED_SENSOR        2   // Sensor Kecepatan (Interrupt)
+#define PIN_WATER_LEVEL         3   // Sensor Level Air (Digital)
+I2C Addresses
+cpp
+#define LCD_I2C_ADDRESS         0x27    // LCD 16x2
+#define RTC_I2C_ADDRESS         0x68    // DS3231
+#define FRAM_I2C_ADDRESS        0x50    // FM24C64
+Algoritma Utama
+Flowchart Sistem
+text
+┌─────────────────────────────────────────────────────┐
+│                    SETUP                           │
+│  1. Serial.begin(9600)                             │
+│  2. ConfigManager.begin() → Init FRAM & I2C        │
+│  3. ButtonManager.begin()                          │
+│  4. RelayManager.begin()                           │
+│  5. SensorManager.begin()                          │
+│  6. RTCManager.begin()                             │
+│  7. LCDManager.begin()                             │
+│  8. WaterLevelManager.begin()                      │
+│  9. IntermittentManager.begin()                    │
+│  10. SprayMode.begin()                             │
+│  11. MenuManager.begin()                           │
+└─────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────┐
+│                     LOOP                           │
+│  1. WaterLevelManager.update()   ← Safety Check    │
+│  2. IF systemBlocked → SKIP semua operasi          │
+│  3. ButtonManager.update()                         │
+│  4. handleButtonEvents()         ← Logika Tombol   │
+│  5. SensorManager.update()                         │
+│  6. checkEngineState()          ← Deteksi Start/Stop│
+│  7. SprayMode.update()                             │
+│  8. IntermittentManager.update()                   │
+│  9. updateWaterPump()          ← Kontrol Pompa    │
+│  10. updateEngineHours()        ← Update KPI       │
+│  11. updateSprayDistance()      ← Update Jarak     │
+│  12. MenuManager.update()                          │
+│  13. displayStatus()           ← Auto-scroll LCD   │
+└─────────────────────────────────────────────────────┘
+Fungsi-Fungsi Kunci
+1. handleButtonEvents() – Logika Tombol (Prioritas)
+cpp
+PRIORITY 1: Menu Aktif
+    → Kirim event ke MenuManager
+
+PRIORITY 2: Kombinasi Long Press (Status + Timer)
+    ├─ B1 + B2 (≥800ms) → Toggle Intermittent Mode (SPRAYER ↔ PUMP)
+    └─ B2 + B3 (≥800ms) → Toggle Trigger Mode (TIME ↔ DISTANCE)
+
+PRIORITY 3: Individual Long Press (Event)
+    ├─ B1 → Toggle Auto Mode
+    ├─ B2 → Toggle Rotary Lamp
+    └─ B3 → Toggle Working Lamp
+
+PRIORITY 4: Individual Short Press (Event)
+    ├─ B1 → Toggle Sprayer RH
+    ├─ B2 → Toggle Sprayer Center
+    └─ B3 → Toggle Sprayer LH
+2. WaterLevelManager – Safety Interlock
+cpp
+update() {
+    Status = readSensor() // TRUE = ada air
+    
+    IF (Status == EMPTY) {
+        systemBlocked = TRUE
+        DISABLE semua output (Sprayer, Pump, Mosfet, Auto_ind)
+        START alarm blinking
+        RETURN
+    }
+    
+    IF (systemBlocked && cooldown selesai) {
+        UNLOCK system
+    }
+    
+    IF (dryRun detected) {
+        systemBlocked = TRUE
+        START cooldown (60 detik)
+    }
+}
+3. IntermittentManager – Mode Auto
+cpp
+update() {
+    IF (!autoMode) RETURN
+    
+    IF (triggerMode == TIME_BASED) {
+        timeBasedLogic() {
+            if (now - lastUpdate >= (isOn ? intervalON : intervalOFF)) {
+                isOn = !isOn
+                toggleOutput()
+            }
+        }
+    } ELSE {
+        distanceBasedLogic() {
+            distanceDelta = currentDistance - lastDistance
+            accumulatedDistance += distanceDelta
+            
+            if (accumulatedDistance >= (isOn ? distanceON : distanceOFF)) {
+                isOn = !isOn
+                toggleOutput()
+            }
+        }
+    }
+}
+4. updateWaterPump() – Kontrol Pompa
+cpp
+IF (!waterLevel.canPumpRun()) {
+    MATIKAN semua output
+    RETURN
+}
+
+sprayerActive = (LH || CENTER || RH)
+intermittentActive = (intermittent.isActive() && intermittent.isSprayerOn())
+
+IF (sprayerActive || intermittentActive) {
+    pump ON
+    // Proportional Valve Control
+    pedal = analogRead(PIN_THROTTLE_PEDAL)
+    pwmValue = map(pedal, 35, 220, 250, 75)  // Inverted control
+    relays.setMosfetGate(pwmValue)
+} ELSE {
+    pump OFF
+    relays.setMosfetGate(0)
+}
+
+
+Cara Pengoperasian
+Navigasi Tombol
+Tombol	Short Press	Long Press (≥800ms)	Kombinasi Long Press
+B1 (RH)	Toggle Sprayer RH	Toggle Auto Mode	B1+B2: Toggle Mode (SPRAYER/PUMP)
+B2 (Center)	Toggle Sprayer Center	Toggle Rotary Lamp	B2+B3: Toggle Trigger (TIME/DISTANCE)
+B3 (LH)	Toggle Sprayer LH	Toggle Working Lamp	B3 (saat menu aktif) → Masuk/Keluar Menu
+Menu Sistem (8 Halaman)
+Cara Masuk: Long Press B3 (>800ms) saat menu tidak aktif.
+
+Menu	Isi	Keterangan
+MAIN	"WATER TRUCK"	Menu utama
+KPI	Distance: X.X km
+Hours: HH:MM	Total jarak & jam operasi
+SPEED	Speed: X.X km/h
+Auto: ON/OFF	Kecepatan & status auto
+CONFIG	Mode: TIME/DIST SPRAY/PUMP
+ON: Xs/m OFF: Xs/m	Konfigurasi intermitten
+INTERMITTENT	INT: ON/OFF [####----]
+Ch: O O O	Status intermitten
+SPRAYER	SPRAY: O O O P:O
+ROT:O LMP:O	Status semua output
+SENSOR	Pulse: 1234 RTC:OK
+Wheel:1.8m P/R:20	Data sensor
+WATER	WATER: OK/EMPTY/LOCKED
+Cooldown: Xs	Status level air
+
+
+Navigasi Menu:
+
+B1 (Short) → Previous Page
+B2 (Short) → Next Page
+B3 (Long) → Keluar Menu
+
+Status Display (Auto-scroll)
+Saat menu tidak aktif, LCD akan auto-scroll 4 halaman setiap 8 detik:
+
+Halaman	Tampilan	Contoh
+1	Engine & Pump Status	E:RUN P:ON Auto:ON Spd:45
+2	Sprayer Status	SPRY: O O O ROT:O LMP:O
+3	KPI Summary	Hours: 123h Dist: 45.6km
+4	Water Level	WATER: OK Status: NORMAL
+
+
+Prioritas Display:
+Emergency (Tanki Kosong) → Blink "⚠️ NO WATER ⚠️"
+Cooldown → "COOLDOWN: 45s"
+Normal → Auto-scroll
+
+Sistem Penyimpanan (FRAM)
+Alamat Memory FM24C64 (8KB = 0x0000 - 0x1FFF)
+cpp
+#define FRAM_CONFIG_START    0x0000   // SystemConfig (44 bytes)
+#define FRAM_KPI_START       0x0040   // KPI (8 bytes)
+#define FRAM_CHECKSUM_ADDR   0x00FE   // Magic Byte (0xAA)
+Data yang Disimpan
+1. SystemConfig (44 bytes)
+cpp
+struct SystemConfig {
+    TriggerMode triggerMode;        // TIME_BASED / DISTANCE_BASED
+    IntermittentMode intermittentMode; // SPRAYER / PUMP
+    unsigned long intervalON;       // ms
+    unsigned long intervalOFF;      // ms
+    float distanceON;               // meter
+    float distanceOFF;              // meter
+    float wheelCircumference;       // meter
+    int pulsePerRev;
+    bool usePotentiometer;
+};
+2. KPI (8 bytes)
+cpp
+struct KPI {
+    float totalDistanceSprayed;   // meter
+    unsigned long engineHours;    // detik
+};
+
+
+Strategi Write untuk Keandalan
+
+Cache di RAM (cachedKPI) untuk mengurangi write ke FRAM.
+Periodic Write: Setiap 1 jam data KPI disimpan ke FRAM.
+Force Write saat engine mati → data tersimpan aman.
+Write pada perubahan konfigurasi → langsung ke FRAM.
+
+Keunggulan FRAM FM24C64
+1 Triliun siklus write (vs EEPROM 1 juta) Tanpa delay write (NoDelay™) Retensi data 45-100 tahun
+
+Fitur Keamanan
+
+1. Water Level Safety Interlock
+Sensor Float Switch membaca level air.
+Tanki Kosong: Langsung matikan semua output, alarm blinking.
+Dry Run Protection: Pompa mati otomatis jika tidak ada air (cooldown 60 detik).
+Emergency Stop: waterLevel.emergencyStop() untuk shutdown total.
+
+2. Watchdog Timer (Opsional)
+Aktifkan: #define ENABLE_WATCHDOG di constants.h
+Timeout: 4 detik
+Fungsi: Reset MCU jika hang
+Panggil resetWatchdog() di setiap loop
+
+3. Power Loss Detection (Opsional)
+Aktifkan: #define ENABLE_POWER_LOSS_DETECT
+Hardware: Kapasitor + Dioda + Komparator
+Fungsi: Menyimpan data ke FRAM saat tegangan turun
+ISR: powerLossISR() → save data → matikan output → sleep
+
+4. Emergency Shutdown
+Trigger: Tanki kosong / Dry run
+Aksi: Matikan semua relay, save data, tampilkan peringatan di LCD
+Recovery: Isi tanki, tunggu cooldown selesai
+
+Troubleshooting
+Masalah: Tombol Long Press Tidak Berfungsi
+Solusi: Pastikan #define BUTTON_LONG_PRESS_TIME_MS 800 di constants.h.
+Periksa logika di ButtonManager::processButton() – hanya satu event long press.
+
+Masalah: I2C Communication Error
+Solusi:
+
+Cek koneksi SDA (A4) dan SCL (A5).
+Pastikan pull-up resistor 4.7kΩ terpasang.
+Periksa alamat I2C:
+LCD: 0x27 atau 0x3F
+RTC: 0x68
+FRAM: 0x50
+Aktifkan debug: #define DEBUG_FRAM dan #define DEBUG_CONFIG.
+
+Masalah: FRAM Tidak Terdeteksi
+Solusi:
+
+Cek power ke FM24C64 (3.3V atau 5V).
+Periksa koneksi pin (VCC, GND, SDA, SCL, WP ke GND).
+Coba Wire.setClock(100000L) (100 kHz) untuk stabilitas.
+
+Masalah: Menu Tidak Masuk
+Solusi: Long Press B3 (>800ms) saat menu tidak aktif.
+Pastikan tidak ada konflik dengan fungsi long press individual (B3 juga untuk toggle Working Lamp).
+
+Masalah: Data KPI Hilang Setelah Restart
+Solusi:
+
+Periksa checksum di FRAM (FRAM_CHECKSUM_ADDR).
+Pastikan config.forceWriteToFRAM() dipanggil di emergencyShutdown().
+Aktifkan ENABLE_POWER_LOSS_DETECT untuk save saat mati mendadak.
+
+Masalah: Pompa Tidak Jalan
+Solusi:
+
+Cek waterLevel.canPumpRun() → FALSE jika tanki kosong atau cooldown aktif.
+Cek sprayerActive dan intermittentActive.
+Cek relay WATER_PUMP (pin 10).
+Periksa MOSFET gate (PWM) dengan oscilloscope.
+
+Debugging
+Aktivasi Debug
+Tambahkan di constants.h:
+
+cpp
+#define DEBUG_MAIN          // Logging utama
+#define DEBUG_WATER_LEVEL   // Logging level air
+#define DEBUG_CONFIG        // Logging konfigurasi & FRAM
+#define DEBUG_FRAM          // Logging FRAM I2C
+#define DEBUG_ENGINE        // Logging engine detection
+#define DEBUG_EEPROM        // (HAPUS – sudah tidak dipakai)
+Log Output Serial (9600 baud)
+text
+=== WATER TRUCK CONTROLLER ===
+Starting initialization...
+✅ Config Manager initialized (FRAM)
+✅ Button Manager initialized
+✅ Relay Manager initialized
+✅ Sensor Manager initialized
+✅ RTC Manager initialized
+✅ LCD Manager initialized
+✅ Water Level Manager initialized
+✅ Intermittent Manager initialized
+✅ Spray Mode Manager initialized
+✅ Menu Manager initialized
+=== INITIALIZATION COMPLETE ===
+Engine: RUNNING
+Total Engine Hours: 123h 45m
+Total Spray Distance: 45.6km
+Ringkasan Algoritma Kunci
+State Machine Sistem
+text
+                    ┌─────────────┐
+                    │   IDLE      │
+                    │ (Tanki OK)  │
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+              ▼            ▼            ▼
+       ┌──────────┐ ┌──────────┐ ┌──────────┐
+       │ MANUAL   │ │ AUTO     │ │ EMERGENCY│
+       │ (Sprayer)│ │ (Interm) │ │ (Locked) │
+       └──────────┘ └──────────┘ └──────────┘
+              │            │            │
+              └────────────┼────────────┘
+                           │
+                           ▼
+                    ┌─────────────┐
+                    │ ENGINE      │
+                    │ MONITORING  │
+                    └─────────────┘
+Alur Penyimpanan Data
+text
+Engine Running
+    ↓
+Update RAM Cache (cachedKPI) ──→ Update setiap detik
+    ↓
+IF (elapsed ≥ 1 jam) ──→ FLUSH ke FRAM
+    ↓
+Engine Stopped / Emergency
+    ↓
+FORCE WRITE ke FRAM (save semua data)
+Spesifikasi Teknis
+Parameter	Nilai
+Mikrokontroler	Arduino Nano (ATmega328P)
+Frekuensi	16 MHz
+Tegangan	12V (Relay) / 5V (Logika)
+I2C Speed	400 kHz
+FRAM	FM24C64 (8KB)
+RTC	DS3231
+LCD	16x2 I2C
+Jumlah Relay	7 (SPST)
+MOSFET Gate	PWM 8-bit (0-255)
+Input Analog	2 (Throttle, Potensiometer)
+Input Digital	4 (Tombol, Sensor)
+Interrupt	1 (Speed Sensor)
+
+
+Credits & Kontribusi
+Sistem ini dikembangkan untuk:
+
+Water Truck Controller
+Aplikasi penyemprotan jalan
+Monitoring KPI kendaraan
+
+Modul-modul kunci:
+
+ConfigManager – Manajemen konfigurasi & KPI
+ButtonManager – Deteksi tombol (Short/Long/Kombinasi)
+IntermittentManager – Mode auto ON/OFF
+WaterLevelManager – Safety interlock air
+FRAMManager – Penyimpanan eksternal via I2C
+
+Lisensi
+Open-source untuk penggunaan komersial dan non-komersial dengan atribusi.
+
+Dokumen ini terakhir diperbarui: [13 july 2026]
+Versi Firmware: 2.0.0 (FRAM support)
+
+
